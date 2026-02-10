@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyaptly"
+version = "1.2.0"
+requires-python = ">=3.3"
+description = "Aptly mirror/snapshot managment automation."
+authors = [{ name = "Adfinis-SyGroup" }]
+license = { text = "AGPL-3.0" }
+keywords = ["aptly", "mirror", "snapshot", "automation"]
+dependencies = [
+    "pyyaml",
+]
+
+[project.scripts]
+pyaptly = "pyaptly:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "hypothesis",
+    "freezegun",
+]

@@ -2,18 +2,10 @@
 import random
 import sys
 
+from hypothesis import strategies as st
+from hypothesis import given
+
 from . import Command, FunctionCommand, test
-
-if not sys.version_info < (2, 7):  # pragma: no cover
-    from hypothesis import strategies as st
-    from hypothesis import given
-
-
-if sys.version_info < (2, 7):  # pragma: no cover
-    import mock
-    given = mock.MagicMock()  # noqa
-    example = mock.MagicMock()  # noqa
-    st = mock.MagicMock()  # noqa
 
 RES_COUNT = 20
 
@@ -52,7 +44,7 @@ def provide_require_st(draw, filter_=True):  # pragma: no cover
             else:
                 provides_filter = provides_set
             if provides_filter:
-                sample = st.sampled_from(provides_filter)
+                sample = st.sampled_from(sorted(provides_filter))
                 requires.append(draw(st.lists(sample, max_size=10)))
             else:
                 requires.append([])
@@ -127,9 +119,12 @@ def run_graph(tree):  # pragma: no cover
         for requires in tree[1][i]:
             cmd.require("virtual", requires)
         commands.append(cmd)
-    ordered = Command.order_commands(commands)
-    assert len(commands) == len(ordered)
+    levels = Command.order_commands(commands)
+    flat = [cmd for level in levels for cmd in level]
+    assert len(commands) == len(flat)
     provided = set()
-    for command in ordered:
-        assert command._requires.issubset(provided)
-        provided.update(command._provides)
+    for level in levels:
+        for command in level:
+            assert command._requires.issubset(provided)
+        for command in level:
+            provided.update(command._provides)

@@ -1,25 +1,22 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 """Aptly mirror/snapshot managment automation."""
 import argparse
 import codecs
 import collections
+import concurrent.futures
 import datetime
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 
-import freeze
-import six
 import yaml
 
 _logging_setup = False
 
-if six.PY2:
-    environb = os.environ  # pragma: no cover
-else:
-    environb = os.environb  # pragma: no cover
+environb = os.environb
 
 
 def init_hypothesis():
@@ -278,9 +275,7 @@ class Command(object):
         """Hash of the command.
 
         :rtype: integer"""
-        return freeze.recursive_hash(
-            (self.cmd, self._requires, self._provides)
-        )
+        return hash((repr(self.cmd), frozenset(self._requires), frozenset(self._provides)))
 
     def __eq__(self, other):
         """Equalitity based on the hash, might collide... hmm"""
@@ -353,13 +348,16 @@ class Command(object):
     @staticmethod
     def order_commands(commands, has_dependency_cb=lambda x: False):
         """Order the commands according to the dependencies they
-        provide/require.
+        provide/require. Returns a list of levels; commands within the same
+        level have no dependency edges between them and can execute in
+        parallel. Levels must be executed in order.
 
         :param          commands: The commands to order
         :type           commands: list
         :param has_dependency_cb: Optional callback the resolve external
                                   dependencies
-        :type  has_dependency_cb: function"""
+        :type  has_dependency_cb: function
+        :rtype: list[list[Command]]"""
 
         commands = set([c for c in commands if c is not None])
 
@@ -369,15 +367,15 @@ class Command(object):
 
         have_requirements = collections.defaultdict(lambda: 0)
         required_number   = collections.defaultdict(lambda: 0)
-        scheduled  = []
+        scheduled  = set()
+        levels = []
 
         for cmd in commands:
             for provide in cmd._provides:
                 required_number[provide] += 1
 
-        something_changed = True
-        while something_changed:
-            something_changed = False
+        while len(scheduled) < len(commands):
+            current_level = []
 
             for cmd in commands:
                 if cmd in scheduled:
@@ -406,39 +404,52 @@ class Command(object):
                     lg.debug(
                         "%s: all dependencies fulfilled" % cmd
                     )
-                    scheduled.append(cmd)
-                    for provide in cmd._provides:
-                        have_requirements[provide] += 1
+                    current_level.append(cmd)
 
-                    something_changed = True
+            if not current_level:
+                break
 
-        unresolved = [
-            cmd
-            for cmd in commands
-            if cmd not in scheduled
-        ]
+            for cmd in current_level:
+                scheduled.add(cmd)
+                for provide in cmd._provides:
+                    have_requirements[provide] += 1
+
+            levels.append(current_level)
+
+        unresolved = [cmd for cmd in commands if cmd not in scheduled]
 
         if len(unresolved) > 0:  # pragma: no cover
             raise ValueError('Commands with unresolved deps: %s' % [
                 str(cmd) for cmd in unresolved
             ])
 
-        # Just one last verification before we commence
-        scheduled_set = set([cmd for cmd in scheduled])
-        incoming_set  = set([cmd for cmd in commands])
-        assert incoming_set == scheduled_set
-
-        lg.info('Reordered commands: %s', [
-            str(cmd) for cmd in scheduled
+        lg.info('Reordered commands into %d levels: %s', len(levels), [
+            [str(cmd) for cmd in level] for level in levels
         ])
 
-        return scheduled
+        return levels
+
+    @staticmethod
+    def run_levels(levels):
+        """Execute a list of levels returned by order_commands. Commands
+        within each level run concurrently; levels are executed in order.
+
+        :param levels: List of levels as returned by order_commands
+        :type  levels: list[list[Command]]"""
+        for level in levels:
+            if len(level) == 1:
+                level[0].execute()
+            else:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [executor.submit(cmd.execute) for cmd in level]
+                    for f in concurrent.futures.as_completed(futures):
+                        f.result()  # re-raise any exception
 
 
 class FunctionCommand(Command):
     """Repesents a function command and is used to resolve dependencies between
-    such commands. This command executes the given function. \*args and
-    \*\*kwargs are passed through.
+    such commands. This command executes the given function. ``*args`` and
+    ``**kwargs`` are passed through.
 
     :param func: The function to execute
     :type  func: callable
@@ -453,15 +464,12 @@ class FunctionCommand(Command):
         self.kwargs = kwargs
 
     def __hash__(self):
-        return freeze.recursive_hash(
-            (
-                id(self.cmd),
-                self.args,
-                self.kwargs,
-                self._requires,
-                self._provides
-            )
-        )
+        return hash((
+            id(self.cmd),
+            self.args,
+            frozenset(self._requires),
+            frozenset(self._provides),
+        ))
 
     def execute(self):
         """Execute the command. (Call the function)."""
@@ -576,40 +584,42 @@ class SystemStateReader(object):
                 self.gpg_keys.add(key)
                 self.gpg_keys.add(key_short)
 
+    def _fetch_one_publish(self, publish):
+        """Fetch source snapshots for a single publish endpoint."""
+        re_snap = re.compile(r"\s+[\w\d-]+\:\s([\w\d-]+)\s\[snapshot\]")
+        prefix, dist = publish.split(' ')
+        data, _ = call_output(["aptly", "publish", "show", dist, prefix])
+        sources = self._extract_sources(data)
+        matches = [re_snap.match(source) for source in sources]
+        return publish, set(match.group(1) for match in matches if match)
+
     def read_publish_map(self):
         """Create a publish map. publish -> snapshots"""
         self.publish_map = {}
-        # match example:  main: test-snapshot [snapshot]
-        re_snap = re.compile(r"\s+[\w\d-]+\:\s([\w\d-]+)\s\[snapshot\]")
-        for publish in self.publishes:
-
-            prefix, dist = publish.split(' ')
-            data, _ = call_output([
-                "aptly", "publish", "show", dist, prefix
-            ])
-
-            sources = self._extract_sources(data)
-            matches = [re_snap.match(source) for source in sources]
-            snapshots = [match.group(1) for match in matches if match]
-            self.publish_map[publish] = set(snapshots)
-
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for publish, snapshots in executor.map(
+                self._fetch_one_publish, self.publishes
+            ):
+                self.publish_map[publish] = snapshots
         lg.debug('Joined snapshots and publishes: %s', self.publish_map)
+
+    def _fetch_one_snapshot(self, snapshot_name):
+        """Fetch source snapshots for a single snapshot."""
+        re_snap = re.compile(r"\s+([\w\d-]+)\s\[snapshot\]")
+        data, _ = call_output(["aptly", "snapshot", "show", snapshot_name])
+        sources = self._extract_sources(data)
+        matches = [re_snap.match(source) for source in sources]
+        return snapshot_name, set(match.group(1) for match in matches if match)
 
     def read_snapshot_map(self):
         """Create a snapshot map. snapshot -> snapshots. This is also called
         merge-tree."""
         self.snapshot_map = {}
-        # match example:  test-snapshot [snapshot]
-        re_snap = re.compile(r"\s+([\w\d-]+)\s\[snapshot\]")
-        for snapshot_outer in self.snapshots:
-            data, _ = call_output([
-                "aptly", "snapshot", "show", snapshot_outer
-            ])
-            sources = self._extract_sources(data)
-            matches = [re_snap.match(source) for source in sources]
-            snapshots = [match.group(1) for match in matches if match]
-            self.snapshot_map[snapshot_outer] = set(snapshots)
-
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for name, sources in executor.map(
+                self._fetch_one_snapshot, self.snapshots
+            ):
+                self.snapshot_map[name] = sources
         lg.debug(
             'Joined snapshots with self(snapshots): %s',
             self.snapshot_map
@@ -1210,8 +1220,7 @@ def repo(cfg, args):
             for repo_name, repo_conf in cfg['repo'].items()
         ]
 
-        for cmd in Command.order_commands(commands, state.has_dependency):
-            cmd.execute()
+        Command.run_levels(Command.order_commands(commands, state.has_dependency))
 
     else:
         if args.repo_name in cfg['repo']:
@@ -1222,8 +1231,7 @@ def repo(cfg, args):
                     cfg['repo'][args.repo_name]
                 )
             ]
-            for cmd in Command.order_commands(commands, state.has_dependency):
-                cmd.execute()
+            Command.run_levels(Command.order_commands(commands, state.has_dependency))
         else:
             raise ValueError(
                 "Requested publish is not defined in config file: %s" % (
@@ -1259,8 +1267,7 @@ def publish(cfg, args):
             if publish_conf_entry.get('automatic-update', 'false') is True
         ]
 
-        for cmd in Command.order_commands(commands, state.has_dependency):
-            cmd.execute()
+        Command.run_levels(Command.order_commands(commands, state.has_dependency))
 
     else:
         if args.publish_name in cfg['publish']:
@@ -1273,8 +1280,7 @@ def publish(cfg, args):
                 for publish_conf_entry
                 in cfg['publish'][args.publish_name]
             ]
-            for cmd in Command.order_commands(commands, state.has_dependency):
-                cmd.execute()
+            Command.run_levels(Command.order_commands(commands, state.has_dependency))
         else:
             raise ValueError(
                 "Requested publish is not defined in config file: %s" % (
@@ -1313,9 +1319,9 @@ def snapshot(cfg, args):
             lg.info('Wrote command dependency tree graph to %s', dot_file)
 
         if len(commands) > 0:
-            for cmd in Command.order_commands(commands,
-                                              state.has_dependency):
-                cmd.execute()
+            Command.run_levels(Command.order_commands(
+                commands, state.has_dependency
+            ))
 
     else:
         if args.snapshot_name in cfg['snapshot']:
@@ -1326,9 +1332,9 @@ def snapshot(cfg, args):
             )
 
             if len(commands) > 0:
-                for cmd in Command.order_commands(commands,
-                                                  state.has_dependency):
-                    cmd.execute()
+                Command.run_levels(Command.order_commands(
+                    commands, state.has_dependency
+                ))
 
         else:
             raise ValueError(
@@ -1697,8 +1703,13 @@ def mirror(cfg, args):
     cmd_mirror = mirror_cmds[args.task]
 
     if args.mirror_name == "all":
-        for mirror_name, mirror_config in cfg['mirror'].items():
-            cmd_mirror(cfg, mirror_name, mirror_config)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(cmd_mirror, cfg, name, conf): name
+                for name, conf in cfg['mirror'].items()
+            }
+            for f in concurrent.futures.as_completed(futures):
+                f.result()  # re-raise any exception
     else:
         if args.mirror_name in cfg['mirror']:
             cmd_mirror(
@@ -1714,9 +1725,13 @@ def mirror(cfg, args):
             )
 
 
+_gpg_lock = threading.Lock()
+
+
 def add_gpg_keys(mirror_config):
     """Uses the gpg command-line to download and add gpg keys needed to create
-    mirrors.
+    mirrors. Serialized via a lock so concurrent mirror operations don't
+    corrupt the shared trustedkeys.gpg keyring.
 
     :param  mirror_config: The configuration yml as dict
     :type   mirror_config: dict
@@ -1737,34 +1752,35 @@ def add_gpg_keys(mirror_config):
             for key in keys:
                 keys_urls[key] = None
 
-    for key in keys_urls.keys():
-        if key in state.gpg_keys:
-            continue
-        try:
-            key_command = [
-                "gpg",
-                "--no-default-keyring",
-                "--keyring",
-                "trustedkeys.gpg",
-                "--keyserver",
-                "pool.sks-keyservers.net",
-                "--recv-keys",
-                key
-            ]
-            lg.debug("Adding gpg key with call: %s", key_command)
-            subprocess.check_call(key_command)
-        except subprocess.CalledProcessError:  # pragma: no cover
-            url = keys_urls[key]
-            if url:
-                key_command = (
-                    "wget -q -O - %s | "
-                    "gpg --no-default-keyring "
-                    "--keyring trustedkeys.gpg --import"
-                ) % url
-                subprocess.check_call(['bash', '-c', key_command])
-            else:
-                raise
-    state.read_gpg()
+    with _gpg_lock:
+        for key in keys_urls.keys():
+            if key in state.gpg_keys:
+                continue
+            try:
+                key_command = [
+                    "gpg",
+                    "--no-default-keyring",
+                    "--keyring",
+                    "trustedkeys.gpg",
+                    "--keyserver",
+                    "pool.sks-keyservers.net",
+                    "--recv-keys",
+                    key
+                ]
+                lg.debug("Adding gpg key with call: %s", key_command)
+                subprocess.check_call(key_command)
+            except subprocess.CalledProcessError:  # pragma: no cover
+                url = keys_urls[key]
+                if url:
+                    key_command = (
+                        "wget -q -O - %s | "
+                        "gpg --no-default-keyring "
+                        "--keyring trustedkeys.gpg --import"
+                    ) % url
+                    subprocess.check_call(['bash', '-c', key_command])
+                else:
+                    raise
+        state.read_gpg()
 
 
 def cmd_mirror_create(cfg, mirror_name, mirror_config):

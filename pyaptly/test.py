@@ -10,20 +10,16 @@ import tempfile
 
 import freezegun
 import pytest
-import six
 import yaml
 
 import pyaptly
 
 hypothesis_min_ver = pytest.mark.skipif(
-    sys.version_info < (2, 7),
-    reason="requires python2.7"
+    sys.version_info < (3,),
+    reason="requires python3"
 )
 
-if six.PY2:  # pragma: no cover
-    environb = os.environ
-else:
-    environb = os.environb  # pragma: no cover
+environb = os.environb
 
 
 def read_yml(file_):

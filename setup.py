@@ -52,9 +52,8 @@ setup(
     },
     install_requires = [
         "pyyaml",
-        "freeze",
-        "six"
     ],
+    python_requires = ">=3.3",
     author = "Adfinis-SyGroup",
     author_email = "https://adfinis-sygroup.ch/",
     description = "Aptly mirror/snapshot managment automation.",
@@ -70,8 +69,8 @@ setup(
         "GNU Affero General Public License v3",
         "Natural Language :: English",
         "Operating System :: OS Independent",
-        "Programming Language :: Python :: 2.6",
-        "Programming Language :: Python :: 2.7",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.3",
         "Programming Language :: Python :: 3.4",
         "Programming Language :: Python :: 3.5",
     ]
