@@ -2,21 +2,12 @@
 
 import os
 import random
-import sys
 import unittest
 
+import hypothesis.strategies as st
+from hypothesis import example, given
+
 from . import test
-
-if not sys.version_info < (2, 7):  # pragma: no cover
-    import hypothesis.strategies as st
-    from hypothesis import example, given  # noqa
-
-
-if sys.version_info < (2, 7):  # pragma: no cover
-    import mock
-    given = mock.MagicMock()  # noqa
-    example = mock.MagicMock()  # noqa
-    st = mock.MagicMock()  # noqa
 
 _test_base = os.path.dirname(
     os.path.abspath(__file__)
@@ -26,11 +17,10 @@ yml_st = st.recursive(
     st.floats(-1, 1) | st.booleans() |
     st.text() | st.none() | st.binary(),
     lambda children: st.lists(
-        children, average_size=5, max_size=10
+        children, max_size=10
     ) | st.dictionaries(
         st.text(),
         children,
-        average_size=5,
         max_size=10
     ),
     max_leaves=30
@@ -56,10 +46,9 @@ class TestTest(unittest.TestCase):
         yml = test.read_yml(path)
         assert 'fakerepo01' not in yml['mirror']
 
-    @test.hypothesis_min_ver
-    @given(yml_st, yml_st, st.random_module())
-    @example({'1': 'Huhu'}, {'1': 'None'}, st.random_module())
-    def test_merge(self, a, b, rand):  # pragma: no cover
+    @given(yml_st, yml_st)
+    @example({'1': 'Huhu'}, {'1': 'None'})
+    def test_merge(self, a, b):
         """Test if merge has the expected result."""
         res  = test.merge(a, b)
         for _ in range(10):
@@ -84,14 +73,14 @@ class TestTest(unittest.TestCase):
                 except (TypeError, KeyError):
                     pass
 
-    def get_path(self, path, data):  # pragma: no cover
+    def get_path(self, path, data):
         for i in path:
             data = data[i]
         if isinstance(data, dict):
             return None
         return data
 
-    def rand_path(self, data):  # pragma: no cover
+    def rand_path(self, data):
         path = []
         while True:
             if isinstance(data, dict):

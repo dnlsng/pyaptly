@@ -29,7 +29,7 @@ def read_yml(file_):
     :type  file_: str"""
     directory = os.path.dirname(file_)
     with codecs.open(file_, encoding="UTF-8") as f:
-        main_yml = dict(yaml.load(f.read()))
+        main_yml = dict(yaml.load(f.read(), Loader=yaml.FullLoader))
     merges = []
     if "merge" in main_yml:
         for merge_path in main_yml['merge']:

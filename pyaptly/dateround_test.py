@@ -2,7 +2,10 @@
 
 import datetime
 import os.path
-import sys
+
+import pytest
+from hypothesis import given
+from hypothesis.strategies import datetimes, integers, times
 
 from . import (date_round_daily, date_round_weekly, iso_to_gregorian,  # noqa
                snapshot_spec_to_name, test, time_delta_helper, time_remove_tz)
@@ -12,23 +15,8 @@ _test_base = os.path.dirname(
 ).encode("UTF-8")
 
 
-if not sys.version_info < (2, 7):  # pragma: no cover
-    from hypothesis import given  # noqa
-    from hypothesis.extra.datetime import datetimes, times  # noqa
-    from hypothesis.strategies import integers  # noqa
-
-
-if sys.version_info < (2, 7):  # pragma: no cover
-    import mock
-    given = mock.MagicMock()  # noqa
-    datetimes = mock.MagicMock()  # noqa
-    times = mock.MagicMock()  # noqa
-    integers = mock.MagicMock()  # noqa
-
-
-@test.hypothesis_min_ver
 @given(datetimes())
-def test_is_to_gregorian(date):  # pragma: no cover
+def test_is_to_gregorian(date):
     """Test if a roundtrip of isoclander() -> iso_to_gregorian() is correct"""
     iso_tuple = date.isocalendar()
     new_date  = iso_to_gregorian(*iso_tuple)
@@ -37,12 +25,11 @@ def test_is_to_gregorian(date):  # pragma: no cover
     assert date.day   == new_date.day
 
 
-@test.hypothesis_min_ver
 @given(
-    datetimes(min_year=2),
+    datetimes(min_value=datetime.datetime(2, 1, 1)),
     integers(min_value=1, max_value=7),
     times())
-def test_round_weekly(date, day_of_week, time):  # pragma: no cover
+def test_round_weekly(date, day_of_week, time):
     """Test if the round function rounds the expected delta"""
     time            = time_remove_tz(time)
     round_date      = date_round_weekly(date, day_of_week, time)
@@ -115,9 +102,8 @@ def test_weekly_examples():
     assert datetime.datetime(2015, 11, 3, 23, 0) == rounded
 
 
-@test.hypothesis_min_ver
 @given(datetimes(), times())
-def test_round_daily(date, time):  # pragma: no cover
+def test_round_daily(date, time):
     """Test if the round function rounds the expected delta"""
     time            = time_remove_tz(time)
     round_date      = date_round_daily(date, time)
@@ -194,6 +180,12 @@ def test_daily_examples():
     assert datetime.datetime(2015, 10, 1, 11, 0) == rounded
 
 
+@pytest.mark.skipif(
+    not os.path.exists(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", ".gnupg"
+    )),
+    reason="requires aptly environment (run 'source testenv && make .gnupg')"
+)
 def test_snapshot_spec_to_name():
     with test.clean_and_config(os.path.join(
             _test_base,
